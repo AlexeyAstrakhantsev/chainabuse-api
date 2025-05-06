@@ -48,14 +48,14 @@ async def create_tables(pool):
             CACHE 1
         ''')
         
-        # Создаем таблицу unified_addresses
+        # Создаем таблицу unified_addresses с увеличенными размерами полей
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS unified_addresses (
-                address character varying(50) NOT NULL,
-                type character varying(20) NOT NULL,
-                address_name character varying(50),
+                address character varying(100) NOT NULL,
+                type character varying(50) NOT NULL,
+                address_name character varying(100),
                 labels json,
-                source character varying(50),
+                source character varying(150),
                 created_at timestamp without time zone NOT NULL DEFAULT timezone('utc'::text, now()),
                 id integer NOT NULL DEFAULT nextval('unified_addresses_id_seq'::regclass),
                 PRIMARY KEY (id)
@@ -100,6 +100,9 @@ async def create_tables(pool):
         logger.info("Database tables created or already exist")
 
 async def fetch_reports_for_chain(chain, pool, clear_tables=False, start_cursor=None):
+    # Добавляем переменную start_time в начало функции
+    start_time = datetime.now()
+    
     url = 'https://www.chainabuse.com/api/graphql-proxy'
     headers = {
         'Content-Type': 'application/json',
