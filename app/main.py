@@ -23,7 +23,7 @@ async def create_tables(pool):
             CREATE TABLE IF NOT EXISTS reports (
                 id TEXT PRIMARY KEY,
                 is_private BOOLEAN,
-                created_at TIMESTAMP WITH TIME ZONE,
+                created_at TEXT,
                 scam_category TEXT,
                 category_description TEXT,
                 bi_directional_vote_count INTEGER,
@@ -204,18 +204,6 @@ async def fetch_reports():
                         if exists:
                             continue
                         
-                        # Правильная обработка даты и времени
-                        try:
-                            # Преобразуем строку в datetime с учетом часового пояса (UTC)
-                            created_at_str = node['createdAt']
-                            if created_at_str.endswith('Z'):
-                                created_at_str = created_at_str[:-1] + '+00:00'
-                            
-                            created_at = datetime.fromisoformat(created_at_str)
-                        except (ValueError, TypeError) as e:
-                            logger.warning(f"Invalid date format: {node.get('createdAt')}. Error: {str(e)}. Using current time.")
-                            created_at = datetime.now(timezone.utc)
-                        
                         # Сохраняем основные данные отчета
                         reported_by = node.get('reportedBy', {}) or {}
                         await connection.execute('''
@@ -226,7 +214,7 @@ async def fetch_reports():
                         ''', 
                             node['id'], 
                             node.get('isPrivate', False), 
-                            created_at,
+                            node.get('createdAt', ''),
                             node.get('scamCategory', ''), 
                             node.get('categoryDescription', ''),
                             node.get('biDirectionalVoteCount', 0), 
