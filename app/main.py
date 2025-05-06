@@ -196,6 +196,16 @@ async def fetch_reports():
                     try:
                         node = report['node']
                         
+                        # Получаем информацию о пользователе, создавшем отчет
+                        reported_by = node.get('reportedBy', {}) or {}
+                        
+                        # Проверяем, является ли пользователь доверенным
+                        is_trusted = reported_by.get('trusted', False)
+                        
+                        # Если пользователь не доверенный, пропускаем отчет
+                        if not is_trusted:
+                            continue
+                        
                         # Проверка на существование отчета
                         exists = await connection.fetchval(
                             'SELECT 1 FROM reports WHERE id = $1', node['id']
@@ -204,13 +214,12 @@ async def fetch_reports():
                         if exists:
                             continue
                         
-                        # Сохраняем основные данные отчета
-                        reported_by = node.get('reportedBy', {}) or {}
+                        # Используем подготовленный запрос с явным указанием типов
                         await connection.execute('''
                             INSERT INTO reports(id, is_private, created_at, scam_category, category_description, 
                                 bi_directional_vote_count, viewer_did_vote, description, comments_count, 
                                 source, checked, reported_by_id, reported_by_username, reported_by_trusted)
-                            VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                            VALUES($1, $2, $3::TEXT, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                         ''', 
                             node['id'], 
                             node.get('isPrivate', False), 
@@ -225,12 +234,12 @@ async def fetch_reports():
                             node.get('checked'),
                             reported_by.get('id', ''), 
                             reported_by.get('username', ''), 
-                            reported_by.get('trusted', False)
+                            is_trusted  # Используем переменную is_trusted вместо повторного доступа к словарю
                         )
                         
                         processed_reports += 1
                         
-                        # Сохраняем связанные адреса
+                        # Сохраняем связанные адреса только для доверенных отчетов
                         addresses = node.get('addresses', []) or []
                         for address in addresses:
                             if not address:
