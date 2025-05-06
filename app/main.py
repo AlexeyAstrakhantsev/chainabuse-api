@@ -3,6 +3,7 @@ import os
 import aiohttp
 import logging
 import asyncio
+import json
 from typing import List, Dict, Any
 from datetime import datetime, timezone
 
@@ -98,7 +99,7 @@ async def create_tables(pool):
         
         logger.info("Database tables created or already exist")
 
-async def fetch_reports_for_chain(chain, pool, clear_tables=False):
+async def fetch_reports_for_chain(chain, pool, clear_tables=False, start_cursor=None):
     url = 'https://www.chainabuse.com/api/graphql-proxy'
     headers = {
         'Content-Type': 'application/json',
@@ -180,6 +181,22 @@ async def fetch_reports_for_chain(chain, pool, clear_tables=False):
         processed_addresses = 0
         skipped_reports = 0
         
+        # Путь к файлу для сохранения прогресса
+        progress_file = f"data/progress_{chain}.json"
+        
+        # Проверяем, существует ли файл с прогрессом
+        if os.path.exists(progress_file) and start_cursor is None:
+            try:
+                with open(progress_file, 'r') as f:
+                    progress_data = json.load(f)
+                    cursor = progress_data.get('cursor')
+                    logger.info(f"Resuming from saved cursor for chain {chain}")
+            except Exception as e:
+                logger.warning(f"Error loading progress file for chain {chain}: {str(e)}")
+                cursor = start_cursor
+        else:
+            cursor = start_cursor
+            
         async with pool.acquire() as connection:
             # Только очищаем данные, если это первая цепочка и флаг clear_tables установлен
             if clear_tables:
@@ -189,8 +206,9 @@ async def fetch_reports_for_chain(chain, pool, clear_tables=False):
                     logger.info("Cleared existing data from the database")
 
             has_next_page = True
-            cursor = None
             page_count = 0
+            retry_count = 0
+            max_retries = 5
             
             while has_next_page:
                 page_count += 1
@@ -198,19 +216,47 @@ async def fetch_reports_for_chain(chain, pool, clear_tables=False):
                     variables["after"] = cursor
                     payload["variables"] = variables
                 
-                async with aiohttp.ClientSession() as session:
-                    try:
+                try:
+                    # Добавляем задержку между запросами, чтобы не перегружать API
+                    await asyncio.sleep(1)  # 1 секунда между запросами
+                    
+                    async with aiohttp.ClientSession() as session:
                         logger.debug(f"Requesting page {page_count} for chain {chain}")
                         async with session.post(url, json=payload, headers=headers) as response:
                             if response.status != 200:
                                 error_text = await response.text()
                                 logger.error(f"API returned error {response.status} for chain {chain}: {error_text}")
-                                break
+                                
+                                # Если получаем ошибку 429 или 5xx, делаем паузу и пробуем снова
+                                if response.status in [429, 500, 502, 503, 504]:
+                                    retry_count += 1
+                                    if retry_count > max_retries:
+                                        logger.warning(f"Max retries reached for chain {chain}, moving on")
+                                        break
+                                    
+                                    # Экспоненциальная задержка: 2^retry_count секунд
+                                    wait_time = 2 ** retry_count
+                                    logger.info(f"Waiting {wait_time} seconds before retry {retry_count}/{max_retries} for chain {chain}")
+                                    await asyncio.sleep(wait_time)
+                                    continue
+                                else:
+                                    # Другие ошибки
+                                    break
                             
                             data = await response.json()
-                    except Exception as e:
-                        logger.error(f"Error during API request for chain {chain}: {str(e)}")
+                            # Сброс счетчика повторных попыток при успешном запросе
+                            retry_count = 0
+                except Exception as e:
+                    logger.error(f"Error during API request for chain {chain}: {str(e)}")
+                    retry_count += 1
+                    if retry_count > max_retries:
+                        logger.warning(f"Max retries reached for chain {chain}, moving on")
                         break
+                    
+                    wait_time = 2 ** retry_count
+                    logger.info(f"Waiting {wait_time} seconds before retry {retry_count}/{max_retries} for chain {chain}")
+                    await asyncio.sleep(wait_time)
+                    continue
                 
                 if 'errors' in data:
                     logger.error(f"GraphQL errors for chain {chain}: {data['errors']}")
@@ -329,6 +375,22 @@ async def fetch_reports_for_chain(chain, pool, clear_tables=False):
                         # Продолжаем обработку других отчетов
                 
                 logger.info(f"Processed page {page_count} with {len(reports)} reports for chain {chain}. Has next page: {has_next_page}")
+                
+                # После обработки страницы сохраняем прогресс
+                if cursor:
+                    try:
+                        os.makedirs(os.path.dirname(progress_file), exist_ok=True)
+                        with open(progress_file, 'w') as f:
+                            json.dump({'cursor': cursor, 'page_count': page_count}, f)
+                    except Exception as e:
+                        logger.warning(f"Error saving progress for chain {chain}: {str(e)}")
+                
+                # Добавляем поддержку прерывания по времени
+                # Если парсер работает более 2 часов, завершаем работу
+                run_time = (datetime.now() - start_time).total_seconds() / 3600
+                if run_time > 2:
+                    logger.info(f"Parser has been running for {run_time:.2f} hours, stopping for chain {chain}")
+                    break
         
         logger.info(f"Finished fetching reports for chain {chain}. "
                    f"Processed {processed_reports} trusted reports, "
