@@ -1,0 +1,11 @@
+.git
+.env
+.venv
+venv
+env
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+data/ 
