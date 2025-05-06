@@ -17,6 +17,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Список сетей для парсинга
+CHAINS = [
+    "BTC", "BINANCE", "ETH", "SOL", "TRON", "POLYGON", "LITECOIN", 
+    "ARBITRUM", "AVALANCHE", "HBAR", "BASE", "CARDANO", "MULTIVERSX", 
+    "TON", "ALGORAND"
+]
+
 async def create_tables(pool):
     async with pool.acquire() as conn:
         await conn.execute('''
@@ -34,7 +41,8 @@ async def create_tables(pool):
                 checked BOOLEAN,
                 reported_by_id TEXT,
                 reported_by_username TEXT,
-                reported_by_trusted BOOLEAN
+                reported_by_trusted BOOLEAN,
+                chain TEXT
             )
         ''')
         
@@ -49,7 +57,7 @@ async def create_tables(pool):
         ''')
         logger.info("Database tables created or already exist")
 
-async def fetch_reports():
+async def fetch_reports_for_chain(chain, pool, clear_tables=False):
     url = 'https://www.chainabuse.com/api/graphql-proxy'
     headers = {
         'Content-Type': 'application/json',
@@ -109,7 +117,7 @@ async def fetch_reports():
     
     variables = {
         "input": {
-            "chains": ["ETH"],
+            "chains": [chain],
             "scamCategories": [],
             "orderBy": {
                 "field": "UPVOTES_COUNT",
@@ -126,24 +134,13 @@ async def fetch_reports():
     }
 
     try:
-        pool = await asyncpg.create_pool(
-            user=os.getenv('DB_USER'),
-            password=os.getenv('DB_PASSWORD'),
-            database=os.getenv('DB_NAME'),
-            host=os.getenv('DB_HOST', 'localhost'),
-            port=os.getenv('DB_PORT', '5432')
-        )
-        
-        # Создаем таблицы, если они не существуют
-        await create_tables(pool)
-        
-        logger.info("Starting to fetch reports from ChainAbuse API")
+        logger.info(f"Starting to fetch reports for chain {chain}")
         processed_reports = 0
         processed_addresses = 0
+        skipped_reports = 0
         
         async with pool.acquire() as connection:
-            # Решаем, нужно ли очищать таблицы перед началом работы
-            clear_tables = os.getenv('CLEAR_EXISTING_DATA', 'false').lower() == 'true'
+            # Только очищаем данные, если это первая цепочка и флаг clear_tables установлен
             if clear_tables:
                 async with connection.transaction():
                     await connection.execute('DELETE FROM report_addresses')
@@ -152,45 +149,48 @@ async def fetch_reports():
 
             has_next_page = True
             cursor = None
+            page_count = 0
             
             while has_next_page:
+                page_count += 1
                 if cursor:
                     variables["after"] = cursor
                     payload["variables"] = variables
                 
                 async with aiohttp.ClientSession() as session:
                     try:
+                        logger.debug(f"Requesting page {page_count} for chain {chain}")
                         async with session.post(url, json=payload, headers=headers) as response:
                             if response.status != 200:
                                 error_text = await response.text()
-                                logger.error(f"API returned error {response.status}: {error_text}")
+                                logger.error(f"API returned error {response.status} for chain {chain}: {error_text}")
                                 break
                             
                             data = await response.json()
                     except Exception as e:
-                        logger.error(f"Error during API request: {str(e)}")
+                        logger.error(f"Error during API request for chain {chain}: {str(e)}")
                         break
                 
                 if 'errors' in data:
-                    logger.error(f"GraphQL errors: {data['errors']}")
+                    logger.error(f"GraphQL errors for chain {chain}: {data['errors']}")
                     break
                 
                 if not data.get('data') or not data['data'].get('reports') or not data['data']['reports'].get('edges'):
-                    logger.warning("No report data received from API")
+                    logger.warning(f"No report data received from API for chain {chain}")
                     break
                 
                 reports_data = data['data']['reports']
                 reports = reports_data['edges']
                 
                 if not reports:
-                    logger.info("No more reports to process")
+                    logger.info(f"No more reports to process for chain {chain}")
                     break
                 
                 page_info = reports_data.get('pageInfo', {})
                 has_next_page = page_info.get('hasNextPage', False)
                 cursor = page_info.get('endCursor')
                 
-                logger.info(f"Processing {len(reports)} reports")
+                logger.info(f"Processing {len(reports)} reports for chain {chain} (page {page_count})")
                 
                 for report in reports:
                     try:
@@ -204,6 +204,7 @@ async def fetch_reports():
                         
                         # Если пользователь не доверенный, пропускаем отчет
                         if not is_trusted:
+                            skipped_reports += 1
                             continue
                         
                         # Проверка на существование отчета
@@ -212,14 +213,16 @@ async def fetch_reports():
                         )
                         
                         if exists:
+                            skipped_reports += 1
                             continue
                         
                         # Используем подготовленный запрос с явным указанием типов
                         await connection.execute('''
                             INSERT INTO reports(id, is_private, created_at, scam_category, category_description, 
                                 bi_directional_vote_count, viewer_did_vote, description, comments_count, 
-                                source, checked, reported_by_id, reported_by_username, reported_by_trusted)
-                            VALUES($1, $2, $3::TEXT, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                                source, checked, reported_by_id, reported_by_username, reported_by_trusted,
+                                chain)
+                            VALUES($1, $2, $3::TEXT, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                         ''', 
                             node['id'], 
                             node.get('isPrivate', False), 
@@ -234,7 +237,8 @@ async def fetch_reports():
                             node.get('checked'),
                             reported_by.get('id', ''), 
                             reported_by.get('username', ''), 
-                            is_trusted  # Используем переменную is_trusted вместо повторного доступа к словарю
+                            is_trusted,
+                            chain  # Добавляем информацию о сети
                         )
                         
                         processed_reports += 1
@@ -257,32 +261,111 @@ async def fetch_reports():
                             )
                             processed_addresses += 1
                     except Exception as e:
-                        logger.error(f"Error processing report: {str(e)}")
+                        logger.error(f"Error processing report for chain {chain}: {str(e)}")
                         # Продолжаем обработку других отчетов
                 
-                logger.info(f"Processed page with {len(reports)} reports. Has next page: {has_next_page}")
+                logger.info(f"Processed page {page_count} with {len(reports)} reports for chain {chain}. Has next page: {has_next_page}")
         
-        logger.info(f"Finished fetching reports. Processed {processed_reports} reports and {processed_addresses} addresses")
+        logger.info(f"Finished fetching reports for chain {chain}. "
+                   f"Processed {processed_reports} trusted reports, "
+                   f"skipped {skipped_reports} reports, "
+                   f"saved {processed_addresses} addresses.")
         
-        await pool.close()
         return {
             "status": "success",
+            "chain": chain,
             "processed_reports": processed_reports,
-            "processed_addresses": processed_addresses
+            "processed_addresses": processed_addresses,
+            "skipped_reports": skipped_reports,
+            "pages_processed": page_count
         }
         
     except Exception as e:
-        logger.exception(f"Error fetching reports: {str(e)}")
+        logger.exception(f"Error fetching reports for chain {chain}: {str(e)}")
+        return {
+            "status": "error",
+            "chain": chain,
+            "error": str(e)
+        }
+
+async def fetch_reports():
+    try:
+        pool = await asyncpg.create_pool(
+            user=os.getenv('DB_USER'),
+            password=os.getenv('DB_PASSWORD'),
+            database=os.getenv('DB_NAME'),
+            host=os.getenv('DB_HOST', 'localhost'),
+            port=os.getenv('DB_PORT', '5432')
+        )
+        
+        # Создаем таблицы, если они не существуют
+        await create_tables(pool)
+        
+        logger.info(f"Starting to fetch reports for {len(CHAINS)} chains")
+        
+        total_stats = {
+            "total_processed_reports": 0,
+            "total_processed_addresses": 0,
+            "total_skipped_reports": 0,
+            "chains_processed": 0,
+            "chains_failed": 0
+        }
+        
+        # Очищаем таблицы только перед обработкой первой сети
+        clear_tables = os.getenv('CLEAR_EXISTING_DATA', 'false').lower() == 'true'
+        
+        # Обрабатываем каждую сеть последовательно
+        for chain in CHAINS:
+            start_time = datetime.now()
+            logger.info(f"Processing chain {chain} ({CHAINS.index(chain) + 1}/{len(CHAINS)})")
+            
+            result = await fetch_reports_for_chain(chain, pool, clear_tables=(clear_tables and CHAINS.index(chain) == 0))
+            
+            end_time = datetime.now()
+            duration = (end_time - start_time).total_seconds()
+            
+            if result["status"] == "success":
+                total_stats["total_processed_reports"] += result["processed_reports"]
+                total_stats["total_processed_addresses"] += result["processed_addresses"]
+                total_stats["total_skipped_reports"] += result["skipped_reports"]
+                total_stats["chains_processed"] += 1
+                
+                logger.info(f"Chain {chain} processed in {duration:.2f} seconds")
+            else:
+                total_stats["chains_failed"] += 1
+                logger.error(f"Chain {chain} processing failed in {duration:.2f} seconds: {result.get('error', 'Unknown error')}")
+        
+        # Закрываем соединение с базой данных
+        await pool.close()
+        
+        logger.info(f"Finished fetching all reports. "
+                   f"Total processed: {total_stats['total_processed_reports']} trusted reports, "
+                   f"skipped: {total_stats['total_skipped_reports']} reports, "
+                   f"saved: {total_stats['total_processed_addresses']} addresses. "
+                   f"Chains processed successfully: {total_stats['chains_processed']}, "
+                   f"failed: {total_stats['chains_failed']}.")
+        
+        return total_stats
+        
+    except Exception as e:
+        logger.exception(f"Error in main fetch_reports function: {str(e)}")
         raise
 
 async def main():
+    start_time = datetime.now()
     logger.info("ChainAbuse parser started")
     
     try:
         result = await fetch_reports()
-        logger.info(f"Parser completed successfully: {result}")
+        end_time = datetime.now()
+        total_duration = (end_time - start_time).total_seconds()
+        
+        logger.info(f"Parser completed successfully in {total_duration:.2f} seconds: {result}")
     except Exception as e:
-        logger.error(f"Parser failed with error: {str(e)}")
+        end_time = datetime.now()
+        total_duration = (end_time - start_time).total_seconds()
+        
+        logger.error(f"Parser failed after {total_duration:.2f} seconds with error: {str(e)}")
         exit(1)
     
     logger.info("ChainAbuse parser finished")
