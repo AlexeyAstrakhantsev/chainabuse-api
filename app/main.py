@@ -18,12 +18,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Режим работы парсера
+PARSE_MODE = os.getenv('PARSE_MODE', 'FULL')  # Возможные значения: FULL, NEW_ONLY
+
 # Список сетей для парсинга
 CHAINS = [
     "BTC", "BINANCE", "ETH", "SOL", "TRON", "POLYGON", "LITECOIN", 
     "ARBITRUM", "AVALANCHE", "HBAR", "BASE", "CARDANO", "MULTIVERSX", 
     "TON", "ALGORAND"
 ]
+
+# Настройки сортировки из переменных окружения
+ORDER_BY_FIELD = os.getenv('ORDER_BY_FIELD', 'UPVOTES_COUNT')  # По умолчанию сортировка по голосам
+ORDER_BY_DIRECTION = os.getenv('ORDER_BY_DIRECTION', 'DESC')   # По умолчанию по убыванию
 
 async def create_tables(pool):
     async with pool.acquire() as conn:
@@ -165,8 +172,8 @@ async def fetch_reports_for_chain(chain, pool, clear_tables=False, start_cursor=
             "chains": [chain],
             "scamCategories": [],
             "orderBy": {
-                "field": "UPVOTES_COUNT",
-                "direction": "DESC"
+                "field": ORDER_BY_FIELD,
+                "direction": ORDER_BY_DIRECTION
             }
         },
         "first": 100
@@ -445,6 +452,20 @@ async def fetch_reports():
             "chains_processed": 0,
             "chains_failed": 0
         }
+        
+        # Если включен режим парсинга только новых данных, меняем порядок сортировки
+        if PARSE_MODE == 'NEW_ONLY':
+            # Для новых данных лучше сортировать по дате создания
+            global ORDER_BY_FIELD, ORDER_BY_DIRECTION
+            ORDER_BY_FIELD = 'CREATED_AT'
+            ORDER_BY_DIRECTION = 'DESC'  # От новых к старым
+            
+            logger.info("Running in NEW_ONLY mode, fetching only new reports")
+            
+            # Можно ограничить количество обрабатываемых страниц для каждой цепи
+            global MAX_PAGES_PER_CHAIN
+            if not os.getenv('MAX_PAGES_PER_CHAIN'):
+                MAX_PAGES_PER_CHAIN = 10  # По умолчанию 10 страниц в режиме NEW_ONLY
         
         # Очищаем таблицы только перед обработкой первой сети
         clear_tables = os.getenv('CLEAR_EXISTING_DATA', 'false').lower() == 'true'
