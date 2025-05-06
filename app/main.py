@@ -336,6 +336,15 @@ async def fetch_reports_for_chain(chain, pool, clear_tables=False, start_cursor=
                             if not address:
                                 continue
                                 
+                            # Получаем адрес    
+                            addr = address.get('address', '')
+                            addr_chain = address.get('chain', '')
+                            
+                            # Проверяем, что адрес не пустой
+                            if not addr:  # Добавленная проверка на пустой адрес
+                                continue  # Пропускаем пустые адреса
+                                
+                            # Сохраняем в таблицу report_addresses
                             await connection.execute('''
                                 INSERT INTO report_addresses(id, report_id, address, chain)
                                 VALUES($1, $2, $3, $4)
@@ -343,15 +352,12 @@ async def fetch_reports_for_chain(chain, pool, clear_tables=False, start_cursor=
                             ''', 
                                 address['id'], 
                                 node['id'], 
-                                address.get('address', ''), 
-                                address.get('chain', '')
+                                addr,  # Используем переменную addr вместо address.get('address', '')
+                                addr_chain
                             )
                             processed_addresses += 1
                             
                             # Формируем данные для unified_addresses
-                            addr = address.get('address', '')
-                            addr_chain = address.get('chain', '')
-                            
                             if addr and addr_chain:
                                 # Получаем имя автора отчета
                                 reporter_username = reported_by.get('username', 'unknown')
