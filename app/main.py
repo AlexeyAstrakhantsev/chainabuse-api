@@ -4,7 +4,7 @@ import aiohttp
 import logging
 import asyncio
 from typing import List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Настройка логирования
 logging.basicConfig(
@@ -23,7 +23,7 @@ async def create_tables(pool):
             CREATE TABLE IF NOT EXISTS reports (
                 id TEXT PRIMARY KEY,
                 is_private BOOLEAN,
-                created_at TIMESTAMP,
+                created_at TIMESTAMP WITH TIME ZONE,
                 scam_category TEXT,
                 category_description TEXT,
                 bi_directional_vote_count INTEGER,
@@ -159,13 +159,17 @@ async def fetch_reports():
                     payload["variables"] = variables
                 
                 async with aiohttp.ClientSession() as session:
-                    async with session.post(url, json=payload, headers=headers) as response:
-                        if response.status != 200:
-                            error_text = await response.text()
-                            logger.error(f"API returned error {response.status}: {error_text}")
-                            break
-                        
-                        data = await response.json()
+                    try:
+                        async with session.post(url, json=payload, headers=headers) as response:
+                            if response.status != 200:
+                                error_text = await response.text()
+                                logger.error(f"API returned error {response.status}: {error_text}")
+                                break
+                            
+                            data = await response.json()
+                    except Exception as e:
+                        logger.error(f"Error during API request: {str(e)}")
+                        break
                 
                 if 'errors' in data:
                     logger.error(f"GraphQL errors: {data['errors']}")
@@ -188,8 +192,8 @@ async def fetch_reports():
                 
                 logger.info(f"Processing {len(reports)} reports")
                 
-                async with connection.transaction():
-                    for report in reports:
+                for report in reports:
+                    try:
                         node = report['node']
                         
                         # Проверка на существование отчета
@@ -200,12 +204,17 @@ async def fetch_reports():
                         if exists:
                             continue
                         
-                        # Преобразование строки даты в объект datetime
+                        # Правильная обработка даты и времени
                         try:
-                            created_at = datetime.fromisoformat(node['createdAt'].replace('Z', '+00:00'))
-                        except ValueError:
-                            logger.warning(f"Invalid date format: {node['createdAt']}. Using current time.")
-                            created_at = datetime.utcnow()
+                            # Преобразуем строку в datetime с учетом часового пояса (UTC)
+                            created_at_str = node['createdAt']
+                            if created_at_str.endswith('Z'):
+                                created_at_str = created_at_str[:-1] + '+00:00'
+                            
+                            created_at = datetime.fromisoformat(created_at_str)
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"Invalid date format: {node.get('createdAt')}. Error: {str(e)}. Using current time.")
+                            created_at = datetime.now(timezone.utc)
                         
                         # Сохраняем основные данные отчета
                         reported_by = node.get('reportedBy', {}) or {}
@@ -250,6 +259,9 @@ async def fetch_reports():
                                 address.get('chain', '')
                             )
                             processed_addresses += 1
+                    except Exception as e:
+                        logger.error(f"Error processing report: {str(e)}")
+                        # Продолжаем обработку других отчетов
                 
                 logger.info(f"Processed page with {len(reports)} reports. Has next page: {has_next_page}")
         
