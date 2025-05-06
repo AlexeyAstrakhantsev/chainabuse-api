@@ -26,6 +26,42 @@ CHAINS = [
 
 async def create_tables(pool):
     async with pool.acquire() as conn:
+        # Проверяем, нужно ли пересоздать таблицы
+        should_recreate = os.getenv('RECREATE_TABLES', 'false').lower() == 'true'
+        
+        if should_recreate:
+            logger.info("Recreating database tables...")
+            # Удаляем существующие таблицы в правильном порядке (из-за внешних ключей)
+            await conn.execute('DROP TABLE IF EXISTS report_addresses')
+            await conn.execute('DROP TABLE IF EXISTS reports')
+            await conn.execute('DROP TABLE IF EXISTS unified_addresses')
+            await conn.execute('DROP SEQUENCE IF EXISTS unified_addresses_id_seq')
+        
+        # Создаем последовательность для id в unified_addresses
+        await conn.execute('''
+            CREATE SEQUENCE IF NOT EXISTS unified_addresses_id_seq 
+            INCREMENT 1 
+            START 1 
+            MINVALUE 1 
+            MAXVALUE 2147483647 
+            CACHE 1
+        ''')
+        
+        # Создаем таблицу unified_addresses
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS unified_addresses (
+                address character varying(50) NOT NULL,
+                type character varying(20) NOT NULL,
+                address_name character varying(50),
+                labels json,
+                source character varying(50),
+                created_at timestamp without time zone NOT NULL DEFAULT timezone('utc'::text, now()),
+                id integer NOT NULL DEFAULT nextval('unified_addresses_id_seq'::regclass),
+                PRIMARY KEY (id)
+            )
+        ''')
+        
+        # Создаем таблицы с актуальной структурой
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS reports (
                 id TEXT PRIMARY KEY,
@@ -55,6 +91,11 @@ async def create_tables(pool):
                 FOREIGN KEY (report_id) REFERENCES reports(id)
             )
         ''')
+        
+        await conn.execute('''
+            CREATE UNIQUE INDEX IF NOT EXISTS unique_address ON unified_addresses(address);
+        ''')
+        
         logger.info("Database tables created or already exist")
 
 async def fetch_reports_for_chain(chain, pool, clear_tables=False):
@@ -260,6 +301,29 @@ async def fetch_reports_for_chain(chain, pool, clear_tables=False):
                                 address.get('chain', '')
                             )
                             processed_addresses += 1
+                            
+                            # Формируем данные для unified_addresses
+                            addr = address.get('address', '')
+                            addr_chain = address.get('chain', '')
+                            
+                            if addr and addr_chain:
+                                # Получаем имя автора отчета
+                                reporter_username = reported_by.get('username', 'unknown')
+                                
+                                # Создаем source в формате "chainabuse marked by <автор отчета>"
+                                source = f"chainabuse marked by {reporter_username}"
+                                
+                                # Сохраняем в таблицу unified_addresses
+                                await connection.execute('''
+                                    INSERT INTO unified_addresses(address, type, address_name, source)
+                                    VALUES($1, $2, $3, $4)
+                                    ON CONFLICT (address) DO NOTHING
+                                ''', 
+                                    addr, 
+                                    'scam', 
+                                    node.get('scamCategory', ''),
+                                    source
+                                )
                     except Exception as e:
                         logger.error(f"Error processing report for chain {chain}: {str(e)}")
                         # Продолжаем обработку других отчетов
