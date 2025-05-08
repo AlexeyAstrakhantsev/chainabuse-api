@@ -32,6 +32,9 @@ CHAINS = [
 ORDER_BY_FIELD = os.getenv('ORDER_BY_FIELD', 'UPVOTES_COUNT')  # По умолчанию сортировка по голосам
 ORDER_BY_DIRECTION = os.getenv('ORDER_BY_DIRECTION', 'DESC')   # По умолчанию по убыванию
 
+# В начале файла
+MAX_CONSECUTIVE_EXISTING = int(os.getenv('MAX_CONSECUTIVE_EXISTING', '5'))
+
 async def create_tables(pool):
     async with pool.acquire() as conn:
         # Проверяем, нужно ли пересоздать таблицы
@@ -190,6 +193,7 @@ async def fetch_reports_for_chain(chain, pool, clear_tables=False, start_cursor=
         processed_reports = 0
         processed_addresses = 0
         skipped_reports = 0
+        skipped_existing = 0  # Счетчик последовательных существующих отчетов
         
         # Путь к файлу для сохранения прогресса
         progress_file = f"data/progress_{chain}.json"
@@ -293,6 +297,27 @@ async def fetch_reports_for_chain(chain, pool, clear_tables=False, start_cursor=
                     try:
                         node = report['node']
                         
+                        # Проверяем существование отчета в базе
+                        exists = await connection.fetchval(
+                            'SELECT 1 FROM reports WHERE id = $1', node['id']
+                        )
+                        
+                        # В режиме NEW_ONLY, если отчет уже существует, увеличиваем счетчик
+                        if PARSE_MODE == 'NEW_ONLY' and exists:
+                            skipped_existing += 1
+                            skipped_reports += 1
+                            
+                            # Если встретили несколько последовательных существующих отчетов,
+                            # прекращаем обработку текущей сети
+                            if skipped_existing >= MAX_CONSECUTIVE_EXISTING:
+                                logger.info(f"Found {skipped_existing} consecutive existing reports for chain {chain}, stopping processing")
+                                has_next_page = False
+                                break
+                            continue
+                        else:
+                            # Сбрасываем счетчик, если нашли новый отчет
+                            skipped_existing = 0
+                        
                         # Получаем информацию о пользователе, создавшем отчет
                         reported_by = node.get('reportedBy', {}) or {}
                         
@@ -301,15 +326,6 @@ async def fetch_reports_for_chain(chain, pool, clear_tables=False, start_cursor=
                         
                         # Если пользователь не доверенный, пропускаем отчет
                         if not is_trusted:
-                            skipped_reports += 1
-                            continue
-                        
-                        # Проверка на существование отчета
-                        exists = await connection.fetchval(
-                            'SELECT 1 FROM reports WHERE id = $1', node['id']
-                        )
-                        
-                        if exists:
                             skipped_reports += 1
                             continue
                         
@@ -388,7 +404,7 @@ async def fetch_reports_for_chain(chain, pool, clear_tables=False, start_cursor=
                                 )
                     except Exception as e:
                         logger.error(f"Error processing report for chain {chain}: {str(e)}")
-                        # Продолжаем обработку других отчетов
+                        continue
                 
                 logger.info(f"Processed page {page_count} with {len(reports)} reports for chain {chain}. Has next page: {has_next_page}")
                 
@@ -407,6 +423,11 @@ async def fetch_reports_for_chain(chain, pool, clear_tables=False, start_cursor=
                 if run_time > 2:
                     logger.info(f"Parser has been running for {run_time:.2f} hours, stopping for chain {chain}")
                     break
+            
+            # Если мы вышли из цикла по отчетам из-за существующих отчетов,
+            # прерываем обработку страниц
+            if not has_next_page:
+                break
         
         logger.info(f"Finished fetching reports for chain {chain}. "
                    f"Processed {processed_reports} trusted reports, "
